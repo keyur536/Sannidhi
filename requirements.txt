@@ -1,0 +1,11 @@
+torch==2.2.2
+torchvision==0.17.2
+facenet-pytorch==2.6.0
+opencv-python==4.9.0.80
+streamlit==1.58.0
+pandas==3.0.3
+openpyxl==3.1.5
+Pillow==10.2.0
+numpy==1.26.4
+reportlab==4.5.1
+gfpgan

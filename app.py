@@ -1,522 +1,384 @@
-"""
-app.py  -  Phase 3: MVP Admin Attendance Panel
-===============================================
-Streamlit web app that:
-  1. Authenticates the admin via a password gate.
-  2. Accepts a classroom photo upload.
-  3. Runs MTCNN to detect & crop every face in the photo.
-  4. Enhances each crop with GFPGAN (GAN face restoration).
-  5. Embeds each crop with InceptionResnetV1 (vggface2).
-  6. Compares against attendance.db via Cosine Similarity (threshold 60%).
-  7. Displays Present / Absent / Unknown split with face crops.
-
-Run:
-    streamlit run app.py
-"""
-
+import streamlit as st
+import cv2
+import numpy as np
+from PIL import Image
+import pandas as pd
+import datetime
 import io
-import uuid
-from datetime import datetime
+import base64
+import time
+import os
 from pathlib import Path
 
-import streamlit as st
-from PIL import Image
-
-# ── Import all models & helpers from model.py ─────────────────────────────────
 from model import (
     load_models, load_gfpgan, enhance_with_gfpgan,
-    detect_and_crop_faces, match_faces_to_students, load_database,
-    COSINE_THRESHOLD, FACE_MARGIN, MIN_FACE_CONF,
-    GFPGAN_UPSCALE, GFPGAN_AVAILABLE, DB_PATH,
+    detect_and_crop_faces, match_faces_to_students,
+    COSINE_THRESHOLD, MIN_FACE_CONF, GFPGAN_AVAILABLE
 )
+import db_utils
+from video_pipeline import extract_frames, crop_face_from_frame, generate_master_embedding
 
-# ── Paths ──────────────────────────────────────────────────────────────────────
-BASE_DIR          = Path(__file__).parent
-FAILED_DIR        = BASE_DIR / "Failed_Detections"
-FAILED_DIR.mkdir(exist_ok=True)
+APP_PASSWORD = "admin123"
 
-# ── Config ─────────────────────────────────────────────────────────────────────
-APP_PASSWORD      = "admin123"
+st.set_page_config(page_title="AI Smart Attendance", page_icon="🎓", layout="wide")
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  Streamlit page config  (must be first Streamlit call)
-# ══════════════════════════════════════════════════════════════════════════════
-st.set_page_config(
-    page_title="Attendance Admin Panel",
-    page_icon="🎓",
-    layout="wide",
-    initial_sidebar_state="collapsed",
-)
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  Custom CSS
-# ══════════════════════════════════════════════════════════════════════════════
+# CSS
 st.markdown("""
 <style>
-  /* ── Google Font ── */
-  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
-
-  html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
-
-  /* ── App background ── */
-  .stApp { background: #0f1117; color: #e8eaf0; }
-
-  /* ── Top header bar ── */
-  .top-bar {
-    background: linear-gradient(135deg, #1a1d2e 0%, #16213e 60%, #0f3460 100%);
-    border-radius: 16px;
-    padding: 24px 32px;
-    margin-bottom: 28px;
-    border: 1px solid rgba(99,179,237,0.15);
-    box-shadow: 0 8px 32px rgba(0,0,0,0.4);
-  }
-  .top-bar h1 { color: #63b3ed; margin: 0; font-size: 1.8rem; font-weight: 700; }
-  .top-bar p  { color: #a0aec0; margin: 4px 0 0; font-size: 0.9rem; }
-
-  /* ── Stat pill ── */
-  .stat-pill {
-    background: rgba(255,255,255,0.05);
-    border: 1px solid rgba(255,255,255,0.1);
-    border-radius: 12px;
-    padding: 16px 20px;
-    text-align: center;
-  }
-  .stat-pill .val { font-size: 2rem; font-weight: 700; }
-  .stat-pill .lbl { font-size: 0.78rem; color: #a0aec0; margin-top: 2px; }
-
-  /* ── Section headers ── */
-  .section-present { color: #68d391; font-size: 1.1rem; font-weight: 600; margin-bottom: 12px; }
-  .section-absent  { color: #fc8181; font-size: 1.1rem; font-weight: 600; margin-bottom: 12px; }
-
-  /* ── Present card ── */
-  .present-card {
-    background: linear-gradient(135deg, rgba(104,211,145,0.08) 0%, rgba(72,187,120,0.04) 100%);
-    border: 1px solid rgba(104,211,145,0.25);
-    border-radius: 14px;
-    padding: 16px 18px;
-    margin-bottom: 14px;
-    transition: border-color 0.2s;
-  }
-  .present-card:hover { border-color: rgba(104,211,145,0.55); }
-  .present-card .student-name { font-size: 1rem; font-weight: 600; color: #e8eaf0; }
-  .present-card .prn-tag {
-    display: inline-block;
-    background: rgba(99,179,237,0.15);
-    color: #63b3ed;
-    border-radius: 20px;
-    padding: 2px 10px;
-    font-size: 0.75rem;
-    font-weight: 500;
-    margin-top: 4px;
-  }
-  .present-card .conf-tag {
-    display: inline-block;
-    background: rgba(104,211,145,0.15);
-    color: #68d391;
-    border-radius: 20px;
-    padding: 2px 10px;
-    font-size: 0.75rem;
-    font-weight: 500;
-    margin-top: 4px;
-    margin-left: 6px;
-  }
-
-  /* ── Absent pill ── */
-  .absent-pill {
-    background: rgba(252,129,129,0.06);
-    border: 1px solid rgba(252,129,129,0.18);
-    border-radius: 10px;
-    padding: 10px 16px;
-    margin-bottom: 8px;
-    font-size: 0.88rem;
-  }
-  .absent-pill .absent-name { color: #e8eaf0; font-weight: 500; }
-  .absent-pill .absent-prn  { color: #718096; font-size: 0.78rem; }
-
-  /* ── Unknown face card ── */
-  .section-unknown { color: #f6ad55; font-size: 1.1rem; font-weight: 600; margin-bottom: 12px; }
-  .unknown-card {
-    background: rgba(246,173,85,0.06);
-    border: 1px solid rgba(246,173,85,0.22);
-    border-radius: 12px;
-    padding: 10px 12px;
-    text-align: center;
-    font-size: 0.78rem;
-    color: #a0aec0;
-  }
-  .unknown-card .score-tag {
-    display: inline-block;
-    background: rgba(246,173,85,0.15);
-    color: #f6ad55;
-    border-radius: 20px;
-    padding: 2px 10px;
-    font-size: 0.72rem;
-    margin-top: 6px;
-  }
-
-  /* ── Login card ── */
-  .login-wrap {
-    max-width: 400px;
-    margin: 80px auto 0;
-    background: linear-gradient(135deg, #1a1d2e, #16213e);
-    border: 1px solid rgba(99,179,237,0.2);
-    border-radius: 20px;
-    padding: 40px 36px;
-    box-shadow: 0 20px 60px rgba(0,0,0,0.5);
-  }
-  .login-title { text-align:center; color:#63b3ed; font-size:1.5rem; font-weight:700; margin-bottom:8px; }
-  .login-sub   { text-align:center; color:#718096; font-size:0.85rem; margin-bottom:28px; }
-
-  /* ── Upload area ── */
-  [data-testid="stFileUploader"] {
-    background: rgba(99,179,237,0.04);
-    border: 2px dashed rgba(99,179,237,0.3);
-    border-radius: 14px;
-    padding: 8px;
-  }
-
-  /* ── Progress / spinner ── */
-  .stSpinner > div { border-top-color: #63b3ed !important; }
-
-  /* ── Divider ── */
-  hr { border-color: rgba(255,255,255,0.07) !important; }
-
-  /* ── Buttons ── */
-  .stButton > button {
-    border-radius: 8px;
-    font-size: 0.8rem;
-    padding: 4px 14px;
-    border: 1px solid rgba(252,129,129,0.4);
-    color: #fc8181;
-    background: rgba(252,129,129,0.08);
-    transition: all 0.2s;
-  }
-  .stButton > button:hover {
-    background: rgba(252,129,129,0.2);
-    border-color: #fc8181;
-  }
-  /* Hide Streamlit's deploy button */
-  .stDeployButton { display: none; }
-
-  /* Hide default Streamlit footer */
-  footer { visibility: hidden; }
+    .card { background-color: #1e253c; border-radius: 12px; padding: 20px; border: 1px solid rgba(255,255,255,0.1); margin-bottom: 20px; }
+    .card:hover { border-color: rgba(99,179,237,0.4); transition: 0.3s; }
+    .title-text { color: #63b3ed; font-size: 1.2rem; font-weight: bold; }
+    .sub-text { color: #a0aec0; font-size: 0.9rem; }
+    .stat-pill { background: rgba(255,255,255,0.05); padding: 8px 15px; border-radius: 20px; margin-right: 10px; font-weight: 600; display: inline-block; }
+    .stat-pill-green { color: #68d391; background: rgba(104,211,145,0.1); }
+    .stat-pill-red { color: #fc8181; background: rgba(252,129,129,0.1); }
+    
+    .present-card { background: rgba(104,211,145,0.08); border: 1px solid rgba(104,211,145,0.25); border-radius: 12px; padding: 12px; display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+    .present-card img { border-radius: 8px; width: 45px; height: 45px; object-fit: cover; border: 1px solid rgba(104,211,145,0.5); }
+    .present-card .name { color: #e8eaf0; font-weight: 600; }
+    .present-card .tags span { background: rgba(99,179,237,0.15); color: #63b3ed; border-radius: 20px; padding: 2px 10px; font-size: 0.75rem; margin-right: 5px;}
+    .present-card .tags .conf { background: rgba(104,211,145,0.15); color: #68d391; }
+    
+    .absent-pill { background: rgba(252,129,129,0.06); border: 1px solid rgba(252,129,129,0.18); border-radius: 10px; padding: 10px 16px; margin-bottom: 8px; font-size: 0.88rem; }
+    .absent-pill .name { color: #e8eaf0; font-weight: 500; }
+    .absent-pill .prn { color: #718096; font-size: 0.78rem; margin-left: 10px; }
+    
+    .unknown-card { background: rgba(246,173,85,0.06); border: 1px solid rgba(246,173,85,0.22); border-radius: 12px; padding: 10px; text-align: center; }
+    .unknown-card img { border-radius: 8px; width: 45px; height: 45px; object-fit: cover; }
+    .unknown-card .score { background: rgba(246,173,85,0.15); color: #f6ad55; border-radius: 20px; padding: 2px 10px; font-size: 0.72rem; margin-top: 5px; display: inline-block;}
 </style>
 """, unsafe_allow_html=True)
 
+# ── Session State ──
+if "auth" not in st.session_state:
+    st.session_state.auth = False
+if "page" not in st.session_state:
+    st.session_state.page = "dashboard"
+if "current_class" not in st.session_state:
+    st.session_state.current_class = None
+if "mtcnn" not in st.session_state:
+    st.session_state.mtcnn = None
+if "facenet" not in st.session_state:
+    st.session_state.facenet = None
+if "gfpgan" not in st.session_state:
+    st.session_state.gfpgan = None
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  Cached model loaders  (run once per session)
-#  All model logic lives in model.py — these wrappers add Streamlit caching.
-# ══════════════════════════════════════════════════════════════════════════════
+def load_ai():
+    if st.session_state.mtcnn is None:
+        with st.spinner("Loading MTCNN & FaceNet..."):
+            mtcnn, facenet, device = load_models()
+            st.session_state.mtcnn = mtcnn
+            st.session_state.facenet = facenet
+            st.session_state.device = device
+            if GFPGAN_AVAILABLE:
+                st.session_state.gfpgan = load_gfpgan()
 
-@st.cache_resource(show_spinner=False)
-def _cached_load_models():
-    return load_models()
-
-
-@st.cache_resource(show_spinner=False)
-def _cached_load_gfpgan():
-    return load_gfpgan()
-
-
-
-@st.cache_data(show_spinner=False)
-def _cached_load_database():
-    return load_database()
-
-
-# Inference helpers now live in model.py — imported at the top.
-
-
-def pil_to_bytes(img: Image.Image, fmt: str = "JPEG") -> bytes:
+def pil_to_base64(img: Image.Image) -> str:
     buf = io.BytesIO()
-    img.save(buf, format=fmt)
-    return buf.getvalue()
+    img.save(buf, format="JPEG")
+    return base64.b64encode(buf.getvalue()).decode()
 
+def nav_to(page, class_id=None):
+    st.session_state.page = page
+    if class_id is not None:
+        st.session_state.current_class = class_id
+    st.rerun()
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  Login gate
-# ══════════════════════════════════════════════════════════════════════════════
-
-def render_login() -> None:
-    st.markdown("""
-    <div class="login-wrap">
-      <div class="login-title">🎓 Attendance System</div>
-      <div class="login-sub">Admin access only. Enter your password to continue.</div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    # Centre the form elements under the card
-    col = st.columns([1, 2, 1])[1]
-    with col:
-        st.markdown("<br>", unsafe_allow_html=True)
-        password = st.text_input(
-            "Password",
-            type="password",
-            placeholder="Enter admin password",
-            label_visibility="collapsed",
-        )
-        if st.button("Login", use_container_width=True):  # use_container_width kept for button — not deprecated
-            if password == APP_PASSWORD:
-                st.session_state["authenticated"] = True
+# ── Login ──
+if not st.session_state.auth:
+    st.markdown("<br><br>", unsafe_allow_html=True)
+    c1, c2, c3 = st.columns([1, 1.5, 1])
+    with c2:
+        st.markdown("<div class='card' style='text-align: center;'>", unsafe_allow_html=True)
+        st.markdown("<h2>🎓 Smart Attendance</h2>", unsafe_allow_html=True)
+        st.markdown("<p style='color:#a0aec0;'>Admin Login</p>", unsafe_allow_html=True)
+        pwd = st.text_input("Password", type="password")
+        if st.button("Login", use_container_width=True):
+            if pwd == APP_PASSWORD:
+                st.session_state.auth = True
                 st.rerun()
             else:
-                st.error("Incorrect password. Please try again.")
+                st.error("Incorrect Password")
+        st.markdown("</div>", unsafe_allow_html=True)
+    st.stop()
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  Main admin panel
-# ══════════════════════════════════════════════════════════════════════════════
-
-def render_panel() -> None:
-    # ── Header ──────────────────────────────────────────────────────────────
-    now = datetime.now().strftime("%A, %d %B %Y  |  %I:%M %p")
-    st.markdown(f"""
-    <div class="top-bar">
-      <h1>🎓 Classroom Attendance Admin Panel</h1>
-      <p>{now}</p>
-    </div>
-    """, unsafe_allow_html=True)
-
-    # ── Sidebar: logout + DB stats ───────────────────────────────────────────
-    with st.sidebar:
-        st.markdown("### ⚙️ Session")
-        if st.button("🔒 Logout"):
-            st.session_state.clear()
-            st.rerun()
-
-        st.markdown("---")
-        db_records = _cached_load_database()
-        st.markdown(f"**Database:** `{DB_PATH.name}`")
-        st.metric("Enrolled Students", len(db_records))
-        st.markdown("---")
-        st.markdown(f"**Threshold:** `{int(COSINE_THRESHOLD*100)}%` cosine similarity")
-        st.markdown(f"**Embedder:** InceptionResnetV1 / VGGFace2")
-        st.markdown(f"**Detector:** MTCNN")
-        gfpgan_status = "Enabled" if GFPGAN_AVAILABLE else "Not installed"
-        st.markdown(f"**Enhancer:** GFPGAN v1.3 ({gfpgan_status})")
-        st.markdown("---")
-        use_gfpgan = st.toggle(
-            "Enable GFPGAN Enhancement",
-            # Activate GFPGAN
-            value=False,  
-            # value=GFPGAN_AVAILABLE,                                # OFF by default — enable from sidebar when needed
-            disabled=not GFPGAN_AVAILABLE,
-            help="Sharpens each detected face before embedding. Slightly slower but improves accuracy on blurry images.",
-        )
-
-    # ── Load models (cached) ─────────────────────────────────────────────────
-    with st.spinner("Loading models (first run only)..."):
-        mtcnn, facenet, device = _cached_load_models()
-        db_records = _cached_load_database()
-        gfpgan_restorer = _cached_load_gfpgan() if GFPGAN_AVAILABLE else None
-
-    if not db_records:
-        st.warning(
-            f"No student records found in `{DB_PATH}`. "
-            "Please run `update_database.py` first."
-        )
-        return
-
-    # ── Upload section ───────────────────────────────────────────────────────
-    st.markdown("### 📷 Upload Classroom Photo")
-    uploaded = st.file_uploader(
-        label="Drag & drop or browse for a classroom image",
-        type=["jpg", "jpeg", "png", "bmp", "webp"],
-        label_visibility="collapsed",
-    )
-
-    if uploaded is None:
-        st.info("Upload a classroom photo above to begin attendance processing.")
-        return
-
-    # Track upload changes
-    st.session_state["_last_upload"] = uploaded.name
-
-    # ── Show uploaded image ──────────────────────────────────────────────────
-    classroom_img = Image.open(uploaded).convert("RGB")
-    with st.expander("📸 View Uploaded Classroom Photo", expanded=False):
-        st.image(classroom_img, width="stretch", caption=uploaded.name)
-
+# ── Sidebar Navigation ──
+with st.sidebar:
+    st.markdown("### 🎓 Attendance System")
+    if st.button("🏠 Dashboard", use_container_width=True):
+        nav_to("dashboard")
+    
+    if st.session_state.current_class:
+        cls = db_utils.get_class(st.session_state.current_class)
+        st.markdown(f"---")
+        st.markdown(f"**Current Class:**\n{cls['class_name']}")
+        if st.button("✅ Take Attendance", use_container_width=True):
+            nav_to("attendance")
+        if st.button("➕ Add Student", use_container_width=True):
+            nav_to("enroll")
+        if st.button("👥 View Students", use_container_width=True):
+            nav_to("view_students")
+        if st.button("📊 View Reports", use_container_width=True):
+            nav_to("reports")
+            
     st.markdown("---")
+    st.markdown(f"⚙️ **System Info**")
+    st.markdown(f"- Threshold: `{COSINE_THRESHOLD}`")
+    st.markdown(f"- GFPGAN: `{'✅' if GFPGAN_AVAILABLE else '❌'}`")
+    if st.button("Logout"):
+        st.session_state.auth = False
+        st.rerun()
 
-    # ── Processing pipeline ──────────────────────────────────────────────────
-    with st.spinner("Detecting faces with MTCNN..."):
-        face_crops = detect_and_crop_faces(classroom_img, mtcnn)
+# ── Routing ──
+page = st.session_state.page
 
-    if not face_crops:
-        st.error(
-            "MTCNN detected no faces in the uploaded image. "
-            "Try a clearer photo with better lighting."
-        )
-        return
+if page == "dashboard":
+    st.title("Class Dashboard")
+    
+    # Create Class Expander
+    with st.expander("➕ Create New Class"):
+        with st.form("new_class_form"):
+            c_name = st.text_input("Class Name*", placeholder="e.g. CS 101 Batch A")
+            c_subj = st.text_input("Subject", placeholder="e.g. Data Structures")
+            c_desc = st.text_area("Description")
+            if st.form_submit_button("Create Class"):
+                if c_name.strip():
+                    db_utils.create_class(c_name.strip(), c_subj.strip(), c_desc.strip())
+                    st.success("Class created!")
+                    st.rerun()
+                else:
+                    st.error("Class Name is required.")
 
-    st.success(f"Detected **{len(face_crops)}** face(s) in the photo.")
-
-    # Replaces the old ESRGAN placeholder.
-    # Each detected face crop is passed through GFPGAN to sharpen and
-    # restore fine facial details before FaceNet embedding.
-    if use_gfpgan and gfpgan_restorer is not None:
-        with st.spinner(f"Enhancing {len(face_crops)} face(s) with GFPGAN ({GFPGAN_UPSCALE}x)..."):
-            inference_crops = [
-                (enhance_with_gfpgan(crop, gfpgan_restorer), bbox)
-                for crop, bbox in face_crops
-            ]
-        st.info(f"GFPGAN enhanced {len(inference_crops)} face crop(s).")
+    st.markdown("### Your Classes")
+    classes = db_utils.get_all_classes()
+    if not classes:
+        st.info("No classes found. Create one above.")
     else:
-        inference_crops = face_crops
-        if not GFPGAN_AVAILABLE:
-            st.caption("GFPGAN not installed — using raw crops. Run: pip install gfpgan")
-
-    with st.spinner("Generating embeddings & matching against database..."):
-        present, absent, unknown = match_faces_to_students(
-            inference_crops, db_records, facenet, device, COSINE_THRESHOLD
-        )
-
-    # ── Stats bar ────────────────────────────────────────────────────────────
-    total     = len(db_records)
-    n_present = len(present)
-    n_absent  = len(absent)
-    n_unknown = len(unknown)
-    pct       = int(n_present / total * 100) if total > 0 else 0
-
-    c1, c2, c3, c4, c5 = st.columns(5)
-    with c1:
-        st.markdown(f"""<div class="stat-pill">
-          <div class="val" style="color:#63b3ed">{total}</div>
-          <div class="lbl">Enrolled Students</div>
-        </div>""", unsafe_allow_html=True)
-    with c2:
-        st.markdown(f"""<div class="stat-pill">
-          <div class="val" style="color:#68d391">{n_present}</div>
-          <div class="lbl">Present</div>
-        </div>""", unsafe_allow_html=True)
-    with c3:
-        st.markdown(f"""<div class="stat-pill">
-          <div class="val" style="color:#fc8181">{n_absent}</div>
-          <div class="lbl">Absent</div>
-        </div>""", unsafe_allow_html=True)
-    with c4:
-        st.markdown(f"""<div class="stat-pill">
-          <div class="val" style="color:#f6ad55">{pct}%</div>
-          <div class="lbl">Attendance Rate</div>
-        </div>""", unsafe_allow_html=True)
-    with c5:
-        st.markdown(f"""<div class="stat-pill">
-          <div class="val" style="color:#b794f4">{n_unknown}</div>
-          <div class="lbl">Unknown Faces</div>
-        </div>""", unsafe_allow_html=True)
-
-    st.markdown("<br>", unsafe_allow_html=True)
-
-    # ── Results columns ──────────────────────────────────────────────────────
-    left_col, right_col = st.columns([3, 2], gap="large")
-
-    # ════════ PRESENT ════════
-    with left_col:
-        st.markdown(
-            f'<div class="section-present">✅ Present Students ({n_present})</div>',
-            unsafe_allow_html=True,
-        )
-
-        if not present:
-            st.markdown(
-                '<div class="absent-pill"><span class="absent-name">No students identified as present.</span></div>',
-                unsafe_allow_html=True,
-            )
-        else:
-            # Sort by name for clean display
-            present_sorted = sorted(present, key=lambda x: x["name"])
-
-            for match in present_sorted:
-                conf_pct = int(match["score"] * 100)
-
-                img_col, info_col = st.columns([1, 3], gap="small")
-
-                with img_col:
-                    st.image(
-                        match["crop_img"],
-                        width="stretch",
-                        caption="",
-                    )
-
-                with info_col:
-                    st.markdown(f"""
-                    <div class="present-card">
-                      <div class="student-name">{match['name']}</div>
-                      <span class="prn-tag">PRN: {match['prn']}</span>
-                      <span class="conf-tag">Confidence: {conf_pct}%</span>
-                    </div>
-                    """, unsafe_allow_html=True)
-
-                st.markdown("<hr style='margin:4px 0 12px'>", unsafe_allow_html=True)
-
-    # ════════ ABSENT ════════
-    with right_col:
-        st.markdown(
-            f'<div class="section-absent">❌ Absent Students ({n_absent})</div>',
-            unsafe_allow_html=True,
-        )
-
-        if not absent:
-            st.success("All enrolled students are present! 🎉")
-        else:
-            absent_sorted = sorted(absent, key=lambda x: x["name"])
-            for s in absent_sorted:
+        cols = st.columns(3)
+        for i, cls in enumerate(classes):
+            c = cols[i % 3]
+            with c:
                 st.markdown(f"""
-                <div class="absent-pill">
-                  <span class="absent-name">{s['name']}</span><br>
-                  <span class="absent-prn">PRN: {s['prn']}</span>
+                <div class="card">
+                    <div class="title-text">{cls['class_name']}</div>
+                    <div class="sub-text">{cls['subject']}</div>
                 </div>
                 """, unsafe_allow_html=True)
+                if st.button("Manage", key=f"manage_{cls['class_id']}", use_container_width=True):
+                    nav_to("attendance", cls['class_id'])
 
-    # ════════ UNKNOWN FACES ════════
-    st.markdown("---")
-    st.markdown(
-        f'<div class="section-unknown">&#x26A0; Unknown Faces Detected ({n_unknown})</div>',
-        unsafe_allow_html=True,
-    )
+elif page == "enroll":
+    cls = db_utils.get_class(st.session_state.current_class)
+    st.title(f"Add Student: {cls['class_name']}")
+    
+    with st.form("enroll_form"):
+        s_name = st.text_input("Student Name*")
+        s_prn = st.text_input("PRN / Roll No.*")
+        uploaded_file = st.file_uploader("Upload Student Video (.mp4) or Image", type=['mp4', 'avi', 'mov', 'jpg', 'jpeg', 'png'])
+        
+        if st.form_submit_button("Enroll Student"):
+            if not s_name or not s_prn or not uploaded_file:
+                st.error("All fields and file are required.")
+            else:
+                load_ai()
+                with st.spinner("Processing..."):
+                    # Process Video or Image
+                    crops = []
+                    if uploaded_file.name.lower().endswith(('.mp4', '.avi', '.mov')):
+                        import tempfile
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
+                            tmp.write(uploaded_file.read())
+                            tmp_path = tmp.name
+                        
+                        try:
+                            # Use existing video pipeline logic but imported
+                            frames = extract_frames(Path(tmp_path))
+                            for frame in frames:
+                                crop = crop_face_from_frame(frame, st.session_state.mtcnn)
+                                if crop:
+                                    crops.append(crop)
+                        finally:
+                            os.remove(tmp_path)
+                    else:
+                        # Image processing
+                        pil_img = Image.open(uploaded_file).convert('RGB')
+                        # Run standard MTCNN detect_and_crop
+                        faces = detect_and_crop_faces(pil_img, st.session_state.mtcnn)
+                        if faces:
+                            # take the largest face (first one if sorted, but detect returns as is, assume first)
+                            # Actually detect_and_crop_faces for keep_all=True might return multiple.
+                            # Just take the first one for simplicity.
+                            crops.append(faces[0][0])
+                    
+                    if not crops:
+                        st.error("No face detected! Please upload a clearer video or image.")
+                    else:
+                        master_emb = generate_master_embedding(crops, st.session_state.facenet, st.session_state.device)
+                        if master_emb is not None:
+                            try:
+                                db_utils.add_student(cls['class_id'], s_prn, s_name, master_emb)
+                                st.success(f"Successfully enrolled {s_name} ({s_prn})!")
+                            except Exception as e:
+                                st.error(f"Database error: {e}")
+                        else:
+                            st.error("Failed to generate embedding.")
 
-    if n_unknown == 0:
-        st.info("No unknown faces detected — every face in the photo matched a student.")
-    else:
-        st.caption(
-            f"These {n_unknown} face(s) were detected by MTCNN but scored below the "
-            f"{int(COSINE_THRESHOLD*100)}% cosine threshold for every enrolled student. "
-            "They may be visitors, staff, or students not yet enrolled in the database."
-        )
-        # Display as a responsive grid (up to 6 per row)
-        cols_per_row = min(n_unknown, 6)
-        rows = [unknown[i:i+cols_per_row]
-                for i in range(0, n_unknown, cols_per_row)]
-        for row in rows:
-            grid = st.columns(cols_per_row)
-            for col, face in zip(grid, row):
-                with col:
-                    st.image(face["crop_img"], width="stretch", caption="")
-                    score_pct = int(face["best_score"] * 100)
-                    st.markdown(
-                        f'<div class="unknown-card">'
-                        f'Unknown<br>'
-                        f'<span class="score-tag">Best match: {score_pct}%</span>'
-                        f'</div>',
-                        unsafe_allow_html=True,
+elif page == "attendance":
+    cls = db_utils.get_class(st.session_state.current_class)
+    st.title(f"Take Attendance: {cls['class_name']}")
+    
+    date = st.date_input("Attendance Date", datetime.date.today())
+    uploaded_photo = st.file_uploader("Upload Classroom Photo", type=['jpg', 'jpeg', 'png'])
+    use_gfpgan = st.checkbox("Enable GFPGAN Face Enhancement", value=False) if GFPGAN_AVAILABLE else False
+    
+    if uploaded_photo and st.button("Process Attendance", type="primary"):
+        load_ai()
+        students_in_class = db_utils.get_students_for_class(cls['class_id'])
+        if not students_in_class:
+            st.warning("No students enrolled in this class yet! Please add students first.")
+        else:
+            with st.spinner("Detecting and matching faces..."):
+                pil_img = Image.open(uploaded_photo).convert("RGB")
+                faces = detect_and_crop_faces(pil_img, st.session_state.mtcnn)
+                
+                if not faces:
+                    st.error("No faces found in the image.")
+                else:
+                    # Optional GFPGAN
+                    if use_gfpgan and st.session_state.gfpgan:
+                        st.toast("Enhancing faces with GFPGAN...")
+                        enhanced_faces = []
+                        for crop, box in faces:
+                            enh = enhance_with_gfpgan(crop, st.session_state.gfpgan)
+                            enhanced_faces.append((enh, box))
+                        faces = enhanced_faces
+                    
+                    present, absent, unknown = match_faces_to_students(
+                        face_crops=faces,
+                        db_records=students_in_class,
+                        facenet=st.session_state.facenet,
+                        device=st.session_state.device
                     )
+                    
+                    # Save to DB
+                    db_utils.save_attendance_session(
+                        class_id=cls['class_id'],
+                        date=date,
+                        present_list=present,
+                        absent_list=absent,
+                        unknown_count=len(unknown)
+                    )
+                    
+                    st.success(f"Attendance saved for {date}!")
+                    
+                    # ── Display Stats ──
+                    st.markdown("---")
+                    col1, col2, col3, col4, col5 = st.columns(5)
+                    col1.metric("Enrolled", len(students_in_class))
+                    col2.metric("Present", len(present))
+                    col3.metric("Absent", len(absent))
+                    rate = (len(present) / len(students_in_class)) * 100 if students_in_class else 0
+                    col4.metric("Attendance %", f"{rate:.1f}%")
+                    col5.metric("Unknown Faces", len(unknown))
+                    
+                    # ── Display Details ──
+                    st.markdown("### ✅ Present")
+                    if present:
+                        pc1, pc2, pc3 = st.columns(3)
+                        for idx, p in enumerate(present):
+                            col = [pc1, pc2, pc3][idx % 3]
+                            b64 = pil_to_base64(p["crop_img"])
+                            with col:
+                                st.markdown(f"""
+                                <div class="present-card">
+                                    <img src="data:image/jpeg;base64,{b64}">
+                                    <div>
+                                        <div class="name">{p['name']}</div>
+                                        <div class="tags">
+                                            <span>{p['prn']}</span>
+                                            <span class="conf">{p['score']*100:.1f}% Match</span>
+                                        </div>
+                                    </div>
+                                </div>
+                                """, unsafe_allow_html=True)
+                    else:
+                        st.info("No present students matched.")
+                        
+                    st.markdown("### ❌ Absent")
+                    if absent:
+                        for a in absent:
+                            st.markdown(f"""
+                            <div class="absent-pill">
+                                <span class="name">{a['name']}</span>
+                                <span class="prn">PRN: {a['prn']}</span>
+                            </div>
+                            """, unsafe_allow_html=True)
+                    else:
+                        st.info("100% Attendance!")
+                        
+                    if unknown:
+                        st.markdown(f"### ⚠️ Unknown ({len(unknown)})")
+                        ucols = st.columns(6)
+                        for idx, u in enumerate(unknown):
+                            b64 = pil_to_base64(u["crop_img"])
+                            with ucols[idx % 6]:
+                                st.markdown(f"""
+                                <div class="unknown-card">
+                                    <img src="data:image/jpeg;base64,{b64}">
+                                    <div class="score">{u['best_score']*100:.1f}%</div>
+                                </div>
+                                """, unsafe_allow_html=True)
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  Entry point
-# ══════════════════════════════════════════════════════════════════════════════
-
-def main() -> None:
-    if "authenticated" not in st.session_state:
-        st.session_state["authenticated"] = False
-
-    if not st.session_state["authenticated"]:
-        render_login()
+elif page == "view_students":
+    cls = db_utils.get_class(st.session_state.current_class)
+    st.title(f"Enrolled Students: {cls['class_name']}")
+    
+    students_in_class = db_utils.get_students_for_class(cls['class_id'])
+    
+    if not students_in_class:
+        st.info("No students are enrolled in this class yet.")
     else:
-        render_panel()
+        st.write(f"**Total Students:** {len(students_in_class)}")
+        
+        # Format data for display
+        display_data = []
+        for s in students_in_class:
+            display_data.append({
+                "PRN / Roll No.": s['prn'],
+                "Name": s['name'],
+                "Enrolled On": s.get('enrolled_at', 'N/A')
+            })
+            
+        df = pd.DataFrame(display_data)
+        st.dataframe(df, use_container_width=True)
 
-
-if __name__ == "__main__":
-    main()
+elif page == "reports":
+    cls = db_utils.get_class(st.session_state.current_class)
+    st.title(f"Reports: {cls['class_name']}")
+    
+    dates = db_utils.get_session_dates(cls['class_id'])
+    if not dates:
+        st.info("No attendance taken yet.")
+    else:
+        sel_date = st.selectbox("Select Date", dates)
+        
+        report_data = db_utils.get_attendance_report(cls['class_id'], sel_date)
+        if report_data:
+            df = pd.DataFrame(report_data)
+            
+            # Format dataframe
+            df['Status'] = df['status'].map({'P': 'Present', 'A': 'Absent', 'U': 'Unknown'})
+            df['Match Confidence'] = df['confidence_score'].apply(lambda x: f"{x*100:.1f}%" if pd.notnull(x) else "-")
+            df = df[['prn', 'name', 'Status', 'Match Confidence']]
+            df.columns = ['PRN', 'Name', 'Status', 'Match Confidence']
+            
+            st.dataframe(df, use_container_width=True)
+            
+            # Download buttons
+            csv = df.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                label="📥 Download CSV",
+                data=csv,
+                file_name=f"Attendance_{cls['class_name']}_{sel_date}.csv",
+                mime="text/csv",
+            )

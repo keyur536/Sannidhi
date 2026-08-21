@@ -199,8 +199,8 @@ def match_faces_to_students(
     A match is accepted only if cosine similarity >= threshold.
 
     Returns:
-        present  - list of {name, prn, score, crop_img}
-        absent   - list of {name, prn}  (enrolled students NOT matched)
+        present  - list of {student_id, name, prn, score, crop_img}
+        absent   - list of {student_id, name, prn}  (enrolled students NOT matched)
         unknown  - list of {crop_img, best_score}  (detected faces not in DB)
     """
     if not db_records:
@@ -227,6 +227,7 @@ def match_faces_to_students(
         if best_rec is not None and best_score >= threshold:
             matched_prns.add(best_rec["prn"])
             present.append({
+                "student_id": best_rec["student_id"],
                 "name":     best_rec["name"],
                 "prn":      best_rec["prn"],
                 "score":    best_score,
@@ -239,29 +240,9 @@ def match_faces_to_students(
             })
 
     absent = [
-        {"name": r["name"], "prn": r["prn"]}
+        {"student_id": r["student_id"], "name": r["name"], "prn": r["prn"]}
         for r in db_records
         if r["prn"] not in matched_prns
     ]
 
     return present, absent, unknown
-
-
-def load_database() -> list[dict]:
-    """
-    Load all student records from attendance.db.
-    Returns a list of dicts: [{prn, name, embedding (np.ndarray)}, ...]
-    """
-    if not DB_PATH.exists():
-        return []
-    conn = sqlite3.connect(DB_PATH)
-    rows = conn.execute("SELECT prn, name, embedding FROM students").fetchall()
-    conn.close()
-    records = []
-    for prn, name, emb_json in rows:
-        records.append({
-            "prn":       prn,
-            "name":      name,
-            "embedding": np.array(json.loads(emb_json), dtype=np.float32),
-        })
-    return records

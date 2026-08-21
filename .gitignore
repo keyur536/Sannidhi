@@ -1,0 +1,28 @@
+# Environments
+.venv/
+env/
+venv/
+ENV/
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Project specific data files
+*.db
+*.sqlite3
+Videos/
+Processed_Videos/
+Failed_Detections/
+*.pdf
+*.mp4
+*.jpg
+*.jpeg
+*.png
+
+# OS generated files
+.DS_Store
+Thumbs.db
