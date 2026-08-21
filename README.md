@@ -48,3 +48,4 @@ streamlit run app.py
 2. **Add Student:** Open the class, click "Add Student", and upload a short `.mp4` video (or image) of the student. The system will automatically extract frames and generate their FaceNet embedding.
 3. **Take Attendance:** Click "Take Attendance", upload a photo of the entire classroom, and the system will automatically match faces and mark students Present/Absent.
 4. **View Reports:** Export date-wise CSV attendance reports directly from the UI.
+
